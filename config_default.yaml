@@ -1,0 +1,34 @@
+# Hyperspectral Anomaly Detection — edit parameters without changing Python code
+
+data:
+  input_file: "Sandiego.mat"           # A1: AVIRIS hyperspectral cube (.mat)
+  groundtruth_file: "PlaneGT.mat"      # Evaluation mask only (0=bg, non-zero=anomaly)
+  crop_rows: 100                       # Scene height — smaller = faster
+  crop_cols: 100                       # Scene width — must match ground truth size
+  remove_bands:                        # A2.1: drop noisy/water-vapor bands (224 → ~186)
+    ranges:
+      - [0, 6]
+      - [32, 35]
+      - [93, 97]
+      - [106, 113]
+      - [152, 166]
+      - [220, 224]
+
+dictionary_construction:
+  win_size: 3                          # A4: 3×3 spatial window for neighborhood context
+  cluster_num: 10                      # A5: K-means groups (material/texture clusters)
+  K: 10                                # A7: SOMP sparsity — atoms per window
+  selected_dic_percent: 0.05           # Top 5% atoms per cluster → background dictionary
+  target_dic_num: 200                  # A8: anomaly dictionary size (high-residual pixels)
+
+lrsr:
+  beta: 0.001                          # A9: sparsity on anomaly S (↑ = fewer detections)
+  lmda: 0.01                           # A9: noise weight on E (↑ = more noise absorbed)
+  max_iterations: 500                  # ALM loop cap (see LRSR.py)
+  convergence_error: 0.000001          # Stop when constraint error below this
+
+output:
+  save_results: true                   # Export metrics/scores to output_dir
+  save_plots: true                     # Save heatmaps, ROC, confusion matrix PNGs
+  output_dir: "results"
+  export_formats: ["mat", "json", "csv"]

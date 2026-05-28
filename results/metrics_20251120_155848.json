@@ -1,0 +1,22 @@
+{
+    "AUC": 0.9914945011124815,
+    "Precision": 0.17337461300309598,
+    "Recall": 0.9824561403508771,
+    "F1_Score": 0.29473684210526313,
+    "Accuracy": 0.9732,
+    "Optimal_Threshold": 0.3984483346909567,
+    "True_Positives": 56,
+    "False_Positives": 267,
+    "True_Negatives": 9676,
+    "False_Negatives": 1,
+    "Confusion_Matrix": [
+        [
+            9676,
+            267
+        ],
+        [
+            1,
+            56
+        ]
+    ]
+}

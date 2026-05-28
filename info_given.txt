@@ -1,0 +1,1250 @@
+================================================================================
+  info_given.txt
+  VISUAL LEARNING DOCUMENT — Hyperspectral Anomaly Detection
+================================================================================
+
+Paper: "Hyperspectral Anomaly Detection via Background and Potential Anomaly
+        Detection"
+IEEE:  https://ieeexplore.ieee.org/abstract/document/8519775
+
+Companion file list: File_info.md (file inventory reference)
+
+Default demo numbers (memorize):
+  rows=100, cols=100, N=10000 pixels
+  bands after removal: B ≈ 186 (224 original minus 38 bad bands)
+  win_size=3 → w²=9 spectra per window
+  cluster_num=10, SOMP K=10, anomaly dict columns=200
+
+================================================================================
+SECTION 1 — BIG PICTURE OVERVIEW
+================================================================================
+
+1.1 WHAT PROBLEM IS BEING SOLVED?
+---------------------------------
+Imagine a satellite photograph where EVERY pixel stores not 3 colors but
+~200 measurements of light at different wavelengths.
+
+Most pixels are "normal" ground: grass, roads, rooftops.
+A FEW pixels might be something else: airplanes, vehicles, chemical spills.
+
+GOAL: Automatically flag those rare "different" pixels WITHOUT showing the
+      computer examples of what an anomaly looks like beforehand.
+
+That is UNSUPERVISED HYPERSPECTRAL ANOMALY DETECTION.
+
+
+1.2 WHY HYPERSPECTRAL IS DIFFERENT FROM RGB
+-------------------------------------------
+
+RGB IMAGE (phone camera):
+  One pixel = [Red, Green, Blue]  →  3 numbers
+
+HYPERSPECTRAL IMAGE (this project):
+  One pixel = [band_1, band_2, ..., band_B]  →  B numbers (B ≈ 186 here)
+
+Visual picture of ONE pixel:
+
+    Intensity
+      ^     *  *     * = measured reflectance at each wavelength
+      |   *     *   *
+      +-------------------> wavelength (370 nm ... 2510 nm)
+            "spectral signature" = material fingerprint
+
+Two pixels can look the same in RGB but differ in hyperspectral shape
+(e.g. painted metal vs real vegetation).
+
+
+1.3 REAL-WORLD ANALOGY (use in viva)
+------------------------------------
+Think of a huge parking lot (background) with 3 foreign cars (anomalies).
+
+- You do NOT know what foreign cars look like in advance.
+- You learn what "typical parking lot spectrum" looks like from thousands
+  of pixels.
+- Any pixel that cannot be explained by typical spectra gets a high
+  "suspicion score."
+
+San Diego dataset: background = city/terrain; anomalies = airplanes on ground.
+
+
+1.4 WHAT THIS REPOSITORY DOES (one sentence)
+--------------------------------------------
+Build TWO spectral dictionaries (background + suspicious), decompose the
+entire image into background + anomaly + noise using math optimization,
+then score each pixel and measure accuracy with ROC/AUC.
+
+
+1.5 TWO CORE IDEAS (names you must know)
+----------------------------------------
+JSR  = Joint Sparse Representation
+       → uses 3×3 neighborhoods to learn dictionaries locally
+
+LRSR = Low-Rank and Sparse Representation
+       → splits full image globally into low-rank background + sparse anomaly
+
+
+1.6 REAL-WORLD APPLICATIONS
+---------------------------
+- Military: vehicles in terrain
+- Environment: pollution, illegal dumping
+- Agriculture: diseased plants
+- Geology: mineral outcrops
+
+
+================================================================================
+SECTION 2 — FULL PIPELINE VISUALIZATION (every stage)
+================================================================================
+
+MASTER PIPELINE (mental movie):
+
+  Sandiego.mat cube
+    → crop 100×100
+    → delete 38 bad bands
+    → reshape to B×N matrix
+    → L2 normalize each pixel
+    → PCA cube for clustering only
+    → 3×3 windows
+    → K-means (10 clusters)
+    → SOMP per window per cluster
+    → background dictionary D_bg
+    → anomaly dictionary D_an (200 atoms)
+    → LRSR: find Z, S, E
+    → reconstruct anomaly part
+    → L2 score per pixel
+    → ROC / AUC vs PlaneGT
+
+MERMAID — full pipeline:
+
+```mermaid
+flowchart TD
+    A[Input Cube HxWx224] --> B[Crop 100x100]
+    B --> C[Band Removal B~186]
+    C --> D[hyperconvert2d BxN]
+    D --> E[L2 Normalize]
+    E --> F[PCA for clustering]
+    F --> G[Windows Bx9xN]
+    G --> H[KMeans 10 clusters]
+    H --> I[SOMP per cluster]
+    I --> J[D_bg and D_an]
+    J --> K[LRSR Z S E]
+    K --> L[target2d BxN]
+    L --> M[Score 1xN]
+    M --> N[ROC AUC]
+```
+
+
+------------------------------------------------------------------------
+STAGE 0: LOAD INPUT
+------------------------------------------------------------------------
+WHERE:     demo.py lines 14-15
+INPUT:     Sandiego.mat on disk
+OUTPUT:    data3d numpy array
+SHAPE:     (H_full, W_full, 224) — full scene before crop
+ROWS MEAN: image row (north-south spatial)
+COLS MEAN: image column (east-west spatial)
+BANDS:     spectral dimension (wavelength index)
+WHY:       Raw measurement from AVIRIS sensor
+NEXT:      Crop
+
+
+------------------------------------------------------------------------
+STAGE 1: SPATIAL CROP
+------------------------------------------------------------------------
+CODE:      data3d = data3d[0:100, 0:100, :]
+INPUT:     (H_full, W_full, 224)
+OUTPUT:    (100, 100, 224)
+WHY:       Smaller experiment → faster dictionary + LRSR (~10-15 min)
+NEXT:      Band removal
+
+
+------------------------------------------------------------------------
+STAGE 2: BAND REMOVAL
+------------------------------------------------------------------------
+CODE:      np.delete(data3d, remove_bands, axis=2)
+REMOVED:   38 band indices (water vapor, noisy regions)
+INPUT:     (100, 100, 224)
+OUTPUT:    (100, 100, B)  where B = 224 - 38 = 186
+WHY:       Bad bands add noise to clustering and sparse coding
+NEXT:      rows, cols, bands = data3d.shape  →  N = 100*100 = 10000
+
+
+------------------------------------------------------------------------
+STAGE 3: LOAD GROUND TRUTH (evaluation only)
+------------------------------------------------------------------------
+FILE:      PlaneGT.mat  variable PlaneGT
+SHAPE:     (100, 100) typically — must match crop
+VALUES:    0 = background pixel, non-zero = anomaly (airplane)
+WHY:       NOT used inside dic_constr loops — only ROC_AUC at end
+NEXT:      dic_constr()
+
+
+------------------------------------------------------------------------
+STAGE 4: RESHAPE TO 2D MATRIX (hyperconvert2d)
+------------------------------------------------------------------------
+WHERE:     dic_constr.py → HyperProTool.hyperconvert2d
+INPUT:     data3d (100, 100, B)
+OUTPUT:    data2d (B, N)   B=186 rows, N=10000 columns
+
+VISUAL:
+
+    3D cube                         2D matrix data2d
+    ┌─────────┐                    ┌───┬───┬───┬─ ─┐
+    │ pixel   │  flatten           │   │   │   │   │  each COLUMN = 1 pixel
+    │ grid    │  ─────────►        │ B │ B │ B │ B │  each ROW = 1 band
+    │ B bands │                    └───┴───┴───┴─ ─┘
+    └─────────┘                      col1 col2 ... col10000
+
+Fortran order ('F') used when reshaping — column-major pixel ordering.
+
+WHY:       Algorithms work on matrices, not 3D cubes
+NEXT:      L2 normalization
+
+
+------------------------------------------------------------------------
+STAGE 5: L2 NORMALIZATION (hypernorm)
+------------------------------------------------------------------------
+FOR EACH column i (each pixel):
+    data2d[:, i] = data2d[:, i] / ||data2d[:, i]||_2
+
+INPUT:     (B, N)
+OUTPUT:    (B, N) same shape, unit-length spectra
+WHY:       Bright sun vs shadow changes overall magnitude; shape matters more
+NEXT:      save data2d.mat, rebuild 3D cube for windowing
+
+
+------------------------------------------------------------------------
+STAGE 6: PCA (clustering helper only)
+------------------------------------------------------------------------
+WHERE:     dic_constr.py sklearn PCA n_components=20
+INPUT:     data2d.T shape (N, B) — fit PCA
+OUTPUT:    reduced data → cube data3d_dim (100, 100, 10)  [note: code uses 10 in reshape]
+WHY:       K-means in 186×9 dimensions per window is heavy; PCA stabilizes clusters
+IMPORTANT: SOMP still uses FULL band windows from original normalized data3d
+NEXT:      hyperwincreat on PCA cube → Kmeans_win
+
+
+------------------------------------------------------------------------
+STAGE 7: WINDOW CREATION (hyperwincreat)
+------------------------------------------------------------------------
+win_size = 3  →  w² = 9 neighbor spectra per pixel
+
+INPUT:     data3d (100, 100, B) for SOMP path
+           data3d_dim (100, 100, 10) for clustering path
+OUTPUT:    win_matrix shape (B, 9, N)  or win_dim (10, 9, N) for PCA path
+
+VISUAL — one pixel p at center of 3×3 patch:
+
+    [p1 p2 p3]
+    [p4 p* p6]   p* = center pixel index in window
+    [p7 p8 p9]
+
+    win_matrix[:, :, p] = stack of 9 spectra, each length B
+                        = matrix (B × 9)
+
+WHY:       Anomaly may be small in space; neighbors give context
+NEXT:      K-means on windows
+
+
+------------------------------------------------------------------------
+STAGE 8: K-MEANS CLUSTERING (Kmeans_win)
+------------------------------------------------------------------------
+INPUT:     win_dim (10, 9, N) — PCA-reduced windows
+OUTPUT:    cluster_assment — length N vector, values 0..9
+
+MEANING:   Pixel p belongs to cluster c if its neighborhood looks like
+           other pixels in cluster c (similar material/texture).
+
+WHY:       Background is diverse — separate grass, roof, road before SOMP
+SAVED:     cluster_assment.mat
+NEXT:      For each cluster 0..9 → run SOMP on all windows in cluster
+
+
+------------------------------------------------------------------------
+STAGE 9: SOMP — Joint Sparse Representation
+------------------------------------------------------------------------
+Per cluster, per window j:
+    X = win_matrix[:, :, j]     shape (B, 9)
+    dictionary = center spectra of windows in cluster
+    somp(dictionary, X, K=10) → alpha, residual
+
+OUTPUT per window: residual matrix (B, 9) — what dictionary could NOT explain
+
+WHY:       Large residual → window contains unusual spectral content
+NEXT:      Score atoms → background dictionary; score residuals → anomaly dict
+
+
+------------------------------------------------------------------------
+STAGE 10: BACKGROUND DICTIONARY D_bg
+------------------------------------------------------------------------
+Per cluster: sparsity_score(atom j) = mean(|coefficients|) / frequency(j)
+Pick top 5% atoms → columns of bg_dic
+
+OUTPUT:    bg_dic shape (B, K_bg)   K_bg = sum over clusters (~hundreds)
+           bg_dic_label — which pixel indices were chosen
+
+WHY:       Stable, frequent, strong atoms = good background prototypes
+NEXT:      anomaly dictionary
+
+
+------------------------------------------------------------------------
+STAGE 11: ANOMALY DICTIONARY D_an
+------------------------------------------------------------------------
+Weighted residual norm per window → sort all N pixels
+Take top 200 pixel spectra as columns
+
+OUTPUT:    tg_dic shape (B, 200)
+           tg_dic_label — pixel indices of top 200
+
+WHY:       Pixels hardest to explain locally are anomaly CANDIDATES
+NEXT:      LRSR(global decomposition)
+
+
+------------------------------------------------------------------------
+STAGE 12: LRSR DECOMPOSITION
+------------------------------------------------------------------------
+EQUATION:  data2d = bg_dic @ Z + tg_dic @ S + E
+
+SHAPES:
+    data2d:  (B, N)      = (186, 10000)
+    bg_dic:  (B, K_bg)
+    tg_dic:  (B, 200)
+    Z:       (K_bg, N)    low-rank background coefficients
+    S:       (200, N)     sparse anomaly coefficients
+    E:       (B, N)       noise
+
+WHY:       Globally separate background subspace vs sparse anomalies
+NEXT:      reconstruction
+
+
+------------------------------------------------------------------------
+STAGE 13: RECONSTRUCTION
+------------------------------------------------------------------------
+background2d = bg_dic @ Z     shape (B, N)
+target2d     = tg_dic @ S     shape (B, N)
+noise        = E              shape (B, N)
+
+CHECK:     background2d + target2d + E ≈ data2d (approximately after convergence)
+
+WHY:       target2d is the "anomaly-only" spectral part per pixel
+NEXT:      scoring
+
+
+------------------------------------------------------------------------
+STAGE 14: ANOMALY SCORE
+------------------------------------------------------------------------
+FOR pixel i (column i):
+    score[i] = || target2d[:, i] ||_2   (Euclidean length of anomaly vector)
+
+OUTPUT:    score vector length N = 10000
+
+WHY:       Large norm → strong anomaly component active
+NEXT:      ROC curve
+
+
+------------------------------------------------------------------------
+STAGE 15: ROC / AUC
+------------------------------------------------------------------------
+INPUT:     scores vs groundtruth labels (flattened)
+OUTPUT:    AUC scalar (0 to 1, higher = better ranking)
+
+WHY:       Measures how well scores separate anomaly vs background pixels
+           at ALL possible thresholds
+
+
+================================================================================
+SECTION 3 — EXECUTION FLOW OF demo.py (exact runtime order)
+================================================================================
+
+3.1 TIMELINE (what runs first → last)
+-------------------------------------
+
+  TIME ─────────────────────────────────────────────────────────────►
+
+  [1] import libraries
+  [2] load Sandiego.mat
+  [3] crop to 100×100
+  [4] delete bad bands
+  [5] load PlaneGT.mat
+  [6] dic_constr()  ─────────── LONG (~5 min)
+  [7] LRSR()        ─────────── LONG (~5-10 min), prints iterations
+  [8] result_show() ────────── opens matplotlib window
+  [9] ROC_AUC()     ────────── opens ROC plot, prints AUC
+
+
+3.2 CALL GRAPH
+--------------
+
+```mermaid
+flowchart TB
+    demo[demo.py main]
+    demo --> load[scipy.io.loadmat]
+    demo --> dic[dic_constr]
+    dic --> h1[hyperconvert2d]
+    dic --> h2[hypernorm]
+    dic --> h3[PCA fit]
+    dic --> h4[hyperwincreat]
+    dic --> h5[Kmeans_win]
+    dic --> h6[somp loops]
+    dic --> savemat[save .mat files]
+    demo --> lrsr[LRSR]
+    demo --> show[result_show]
+    show --> loadcluster[load cluster_assment.mat]
+    demo --> roc[ROC_AUC]
+```
+
+
+3.3 WHAT EACH STEP RETURNS
+--------------------------
+
+| Step | Function | Returns |
+|------|----------|---------|
+| 6 | dic_constr | data2d, bg_dic, tg_dic, bg_dic_label, tg_dic_label |
+| 7 | LRSR | Z, E, S |
+| 8 | result_show | background2d, target2d |
+| 9 | ROC_AUC | auc (float) |
+
+
+3.4 FILES WRITTEN TO DISK (during dic_constr)
+---------------------------------------------
+
+  data2d.mat
+  cluster_assment.mat    ← result_show READS this later
+  win_matrix.mat
+  bg_dic.mat
+  tg_dic.mat
+  bg_dic_ac_label.mat
+  tg_dic_label.mat
+
+ORDER WARNING: If you run result_show without running dic_constr first,
+               cluster_assment.mat missing → ERROR.
+
+
+3.5 CONSOLE OUTPUT YOU WILL SEE
+-------------------------------
+
+  "current calculate cluster 0 ..."
+  "current calculate cluster 1 ..."
+  ...
+  "successs!!"
+  "iteration:1"
+  "max err is:..."
+  "iteration:2"
+  ...
+  "Converged: ..."  (maybe)
+  "The AUC is: 0.xxxx"
+
+
+================================================================================
+SECTION 4 — MODULE-BY-MODULE BREAKDOWN
+================================================================================
+
+4.1 demo.py — THE CONDUCTOR
+---------------------------
+RESPONSIBILITY: Load data, call pipeline in order, print AUC.
+DOES NOT: Implement math — only orchestrates.
+
+KEY CODE:
+```
+data2d, bg_dic, tg_dic, bg_dic_label, tg_dic_label =
+    dic_constr(data3d, groundtruth, 3, 10, 10, 0.05, 200)
+Z, E, S = LRSR(bg_dic, tg_dic, data2d, 0.001, 0.01)
+background2d, target2d = result_show(...)
+auc = ROC_AUC(target2d, groundtruth)
+```
+
+VISUAL: demo.py is the train route — stations are other files.
+
+
+4.2 dic_constr.py — DICTIONARY FACTORY
+--------------------------------------
+RESPONSIBILITY: Build D_bg and D_an from data.
+
+INPUT:  data3d (100,100,B), groundtruth (unused in body), parameters
+OUTPUT: data2d (B,N), bg_dic (B,K_bg), tg_dic (B,200), labels
+
+EXECUTION FLOW INSIDE:
+
+```mermaid
+flowchart TD
+    start[dic_constr start] --> c2d[hyperconvert2d]
+    c2d --> norm[hypernorm L2]
+    norm --> pca[PCA 20D]
+    pca --> winP[windows on PCA cube]
+    winP --> km[Kmeans_win]
+    km --> winF[windows on full cube]
+    winF --> loop[for each cluster 0..9]
+    loop --> somp[somp each window]
+    somp --> score[sparsity score]
+    score --> bg[append bg atoms]
+    loop --> res[collect residuals]
+    res --> tg[top 200 anomaly pixels]
+    bg --> ret[return dictionaries]
+    tg --> ret
+```
+
+MATRIX TRANSFORM: 3D cube → 2D (B×N) stays backbone through LRSR.
+
+
+4.3 HyperProTool.py — TOOLBOX
+-----------------------------
+
+| Function | In → Out | Purpose |
+|----------|----------|---------|
+| hyperconvert2d | (H,W,B)→(B,N) | Flatten cube to pixel columns |
+| hyperconvert3d | (B,N)→(H,W,B) | Restore cube for plotting |
+| hypernorm | (B,N)→(B,N) | L2 unit vectors per pixel |
+| hyperwincreat | (H,W,B)→(B,w²,N) | Spatial neighborhoods |
+| Kmeans_win | (B,w²,N)→labels N | Group similar patches |
+| hyper_IPD | patch distance | Custom distance for clustering |
+| somp | dict(B,M), X(B,w²)→residual | Joint sparse coding |
+
+SOMP SNIPPET (concept):
+```
+for i in range(K):
+    pick atom with max ||R^T * dict||
+    update coefficients alpha
+    R = X - chosen_atoms @ alpha
+```
+
+VISUAL: somp shrinks residual R step by step like explaining a puzzle.
+
+
+4.4 LRSR.py — GLOBAL SEPARATOR
+------------------------------
+RESPONSIBILITY: Find Z, S, E solving data = D_bg Z + D_an S + E
+
+INPUT SHAPES:
+  DictLRR = bg_dic  (B, K_bg)
+  DictSRC = tg_dic  (B, 200)
+  data    = data2d  (B, N)
+
+OUTPUT:
+  Z (K_bg, N), S (200, N), E (B, N)
+
+LOOP: up to 500 iterations until error < threshold
+
+PER ITERATION (visual):
+  1. SVD threshold on Z side  → enforce LOW-RANK
+  2. Shrink noise E columns   → small noise
+  3. Shrink S entries         → SPARSE anomalies
+  4. Update Z, S linear solves
+  5. Update Lagrange multipliers Y1,Y2,Y3
+
+
+4.5 result_show.py — EYES
+-------------------------
+RECONSTRUCT:
+  background2d = np.dot(bg_dic, Z)
+  target2d     = np.dot(tg_dic, S)
+
+SIX SUBPLOTS:
+  1. mean(background3d) over bands → background image
+  2. mean(target3d)     → anomaly heatmap
+  3. mean(noise3d)       → noise map
+  4. bg_dic_show        → where bg atoms came from
+  5. tg_dic_show        → where anomaly atoms came from
+  6. cluster map        → K-means regions
+
+
+4.6 ROC_AUC.py — JUDGE
+-----------------------
+SCORE:
+```
+for i in range(rows * cols):
+    result[0, i] = np.linalg.norm(target2d[:, i])
+```
+
+Compare result to groundtruth → roc_curve → auc
+
+Optional path: demo_enhanced.py adds precision/recall/F1 and exports to results/
+
+
+================================================================================
+SECTION 5 — TENSOR / MATRIX VISUALIZATION
+================================================================================
+
+5.1 GOLDEN RULE FOR THIS PROJECT
+--------------------------------
+In data2d and most 2D matrices:
+  ROWS    = spectral bands (wavelength index)
+  COLUMNS = pixels (spatial locations flattened)
+
+Multiplication: (B, K) @ (K, N) = (B, N)  ← K coefficients per pixel column
+
+
+5.2 SHAPE LADDER (default demo)
+
+```mermaid
+flowchart LR
+    s0["data3d 100x100x186"]
+    s1["data2d 186x10000"]
+    s2["win 186x9x10000"]
+    s3["bg_dic 186xKbg"]
+    s4["tg_dic 186x200"]
+    s5["Z Kbg x10000"]
+    s6["S 200x10000"]
+    s7["target2d 186x10000"]
+    s8["score 10000"]
+    s0 --> s1 --> s2
+    s1 --> s3
+    s1 --> s4
+    s3 --> s5
+    s4 --> s6
+    s5 --> s7
+    s6 --> s7
+    s7 --> s8
+```
+
+
+5.3 MATRIX REFERENCE TABLE
+
+| Name | Shape | Row meaning | Column meaning |
+|------|-------|-------------|----------------|
+| data3d | 100×100×B | spatial row | spatial col; depth=B bands |
+| data2d | B×N | band index | pixel index |
+| win_matrix | B×9×N | band | neighbor in 3×3; pixel |
+| bg_dic | B×K_bg | band | bg atom index |
+| tg_dic | B×200 | band | anomaly atom index |
+| Z | K_bg×N | bg atom coeff | pixel |
+| S | 200×N | anomaly atom coeff | pixel |
+| E | B×N | band | pixel |
+| target2d | B×N | band | pixel anomaly reconstruction |
+| groundtruth | 100×100 | spatial | spatial label |
+
+
+5.4 MULTIPLY VISUAL: tg_dic @ S
+
+    tg_dic (186×200)  ×  S (200×10000)  =  target2d (186×10000)
+
+    For ONE pixel column i:
+        target2d[:, i] = weighted sum of 200 anomaly atom spectra
+        using coefficients S[:, i]
+
+    If S[:, i] ≈ 0  →  pixel looks like background only
+    If S[:, i] large →  strong anomaly signature
+
+
+================================================================================
+SECTION 6 — ONE PIXEL JOURNEY (trace pixel p)
+================================================================================
+
+Pick pixel p at row r=50, col c=60.
+Linear index: p = r * cols + c = 50*100 + 60 = 5060  (Fortran ordering in reshape)
+
+6.1 ORIGINAL SPECTRUM
+---------------------
+data3d[50, 60, :]  → vector length B=186
+Values = raw reflectance at each wavelength.
+
+ASCII:
+  band 0   band 1   ...   band 185
+    |        |                  |
+    v        v                  v
+  [0.12,  0.08,  ...,  0.15]  = spectrum vector
+
+
+6.2 AFTER hyperconvert2d + L2 NORM
+----------------------------------
+Column data2d[:, 5060] = unit vector length 1.0
+Same shape information, brightness removed.
+
+
+6.3 WINDOW NEIGHBORHOOD
+-----------------------
+win_matrix[:, :, 5060] is (186 × 9):
+  9 columns = spectra of 3×3 patch around (50,60)
+
+    [49,59][49,60][49,61]
+    [50,59][50,60][50,61]
+    [51,59][51,60][51,61]
+
+If airplane wing crosses this patch → center or neighbors unusual.
+
+
+6.4 CLUSTER ASSIGNMENT
+----------------------
+cluster_assment[5060] = k  (some integer 0..9)
+Pixel grouped with patches that look similar in PCA-window space.
+
+
+6.5 SOMP INSIDE CLUSTER k
+-------------------------
+Window X = win_matrix[:,:,5060]
+Dictionary = other center pixels in cluster k
+SOMP picks K=10 atoms to approximate X
+residual R = what is LEFT unexplained
+
+IF airplane pixel: residual LARGE
+IF plain grass: residual SMALL
+
+
+6.6 DICTIONARY MEMBERSHIP
+-------------------------
+Maybe pixel 5060 NOT in top 5% bg atoms.
+Maybe pixel 5060 IS among top 200 residual pixels → column in tg_dic
+   tg_dic[:, j] = data2d[:, 5060] for some j
+
+
+6.7 LRSR COLUMN 5060
+--------------------
+Entire column data2d[:,5060] reconstructed:
+  data2d[:,5060] ≈ bg_dic@Z[:,5060] + tg_dic@S[:,5060] + E[:,5060]
+
+For anomaly airplane pixel: S[:,5060] may have few large entries.
+
+
+6.8 ANOMALY SCORE
+-----------------
+score[5060] = || target2d[:, 5060] ||_2
+
+High score → flagged suspicious.
+Compared to all 10000 scores in ROC.
+
+
+6.9 PIXEL JOURNEY DIAGRAM
+
+```mermaid
+flowchart TD
+    pix[Pixel 50,60 spectrum] --> norm[L2 normalize]
+    norm --> win[3x3 window Bx9]
+    win --> clust[cluster ID k]
+    clust --> somp[SOMP residual]
+    somp --> maybeAnom{Top 200 residual?}
+    maybeAnom -->|yes| inDict[In tg_dic]
+    maybeAnom -->|no| bgOnly[Background only]
+    inDict --> lrsrCol[Column p of S]
+    lrsrCol --> score[L2 norm score]
+    score --> roc[ROC point]
+```
+
+
+================================================================================
+SECTION 7 — VISUAL ANALOGIES
+================================================================================
+
+7.1 DICTIONARY ATOMS = INGREDIENTS IN A KITCHEN
+-----------------------------------------------
+Each column of bg_dic is a "recipe flavor" (grass, asphalt, roof).
+Pixels mix few flavors (sparse coefficients) to form their spectrum.
+
+
+7.2 SOMP = CHOOSING SPICES THAT WORK TOGETHER
+---------------------------------------------
+Not one spice per dish alone — pick K spices that TOGETHER explain the
+whole 3×3 tasting plate (9 small tastes = 9 spectra in window).
+
+
+7.3 RESIDUAL = TASTE STILL UNEXPLAINED
+--------------------------------------
+After best spices, leftover taste = residual.
+Strange leftover → possible foreign object (anomaly).
+
+
+7.4 LOW-RANK BACKGROUND = FEW THEMES IN A MOVIE
+-----------------------------------------------
+Thousands of pixels but only ~few background "themes" (grass, road, water).
+Coefficient matrix Z can be approximately low-rank.
+
+
+7.5 SPARSE ANOMALIES = WRONG NOTES IN A QUIET SONG
+-------------------------------------------------
+99.9% pixels silent in anomaly coefficients S; few pixels loud (airplanes).
+
+
+7.6 LRSR = THREE-LAYER CAKE PER PIXEL
+-------------------------------------
+Layer 1 (bg_dic @ Z): normal cake base
+Layer 2 (tg_dic @ S): rare hot chili spot
+Layer 3 (E): sensor crumb noise
+
+
+7.7 SPECTRAL SIGNATURE = FINGERPRINT
+------------------------------------
+RGB: 3-point fingerprint (blurry)
+Hyperspectral: 186-point fingerprint (detailed)
+
+
+================================================================================
+SECTION 8 — ALGORITHM EXPLANATIONS (WHY → WHAT → HOW)
+================================================================================
+
+8.1 PCA
+-------
+WHY: Clustering windows in 186×9 space is noisy; PCA finds main directions.
+WHAT: Compress each pixel spectrum to 20 principal components for K-means only.
+HOW VISUALLY: Squash a 186-D arrow to 20-D arrow keeping most variation.
+
+
+8.2 K-MEANS (Kmeans_win + hyper_IPD)
+----------------------------------
+WHY: Background has multiple materials — separate before building dictionaries.
+WHAT: Group N windows into 10 clusters of similar patches.
+HOW: Repeat assign-to-nearest-centroid → recompute centroid until stable.
+
+
+8.3 SOMP
+--------
+WHY: Pixels appear in groups (3×3); joint coding shares atoms across neighbors.
+WHAT: Greedy selection of K dictionary columns minimizing Frobenius error ||X-Dα||.
+HOW VISUALLY:
+  Step0 R=X
+  Step1 pick best atom, subtract projection
+  Step2 pick next best on NEW residual
+  ...
+  StepK stop, measure leftover R
+
+
+8.4 LRSR OBJECTIVE
+------------------
+WHY: Need global rule: background shared + anomalies rare + noise small.
+WHAT: Minimize ||Z||_* + β||S||_1 + λ||E||_{2,1} subject to reconstruction.
+HOW: Balance three penalties — like three springs pulling Z, S, E.
+
+
+8.5 NUCLEAR NORM ||Z||_*
+------------------------
+WHY: Encourage Z low-rank (few background factors).
+WHAT: Sum of singular values of Z.
+HOW VISUALLY: If Z were a spreadsheet of pixel coefficients, many rows
+              are redundant combinations of few master rows.
+
+
+8.6 L1 ON S — SPARSITY
+----------------------
+WHY: Anomalies are rare — most columns of S should be zero.
+WHAT: Sum of absolute values of all entries in S.
+HOW: Soft-threshold shrinks small values to exact zero each ALM iteration.
+
+
+8.7 L2,1 ON E — NOISE
+---------------------
+WHY: Noise affects some pixels but should not look like structured anomaly.
+WHAT: Sum over pixels of L2 norm of spectral error column.
+HOW: Column-wise shrink — whole pixel noise vector scaled down together.
+
+
+8.8 ALM (Augmented Lagrangian Method)
+-------------------------------------
+WHY: Constraint data = D_bg Z + D_an S + E is hard — ALM splits into easy steps.
+WHAT: Alternate updating Z,S,E while increasing penalty μ on mismatch.
+HOW VISUALLY:
+  ┌─────────────────────────────────────┐
+  │ iteration k:                         │
+  │   fix mismatch with SVD / shrink   │
+  │   nudge multipliers Y              │
+  │   μ *= 1.1 (push harder)           │
+  │   if error small → STOP            │
+  └─────────────────────────────────────┘
+
+```mermaid
+flowchart LR
+    init[Init Z,S,E,Y,mu] --> svd[SVT low-rank J]
+    svd --> noise[Shrink E]
+    noise --> sparse[Shrink S]
+    sparse --> updZ[Update Z]
+    updZ --> updS[Update S]
+    updS --> mult[Update Y1 Y2 Y3]
+    mult --> check{converged?}
+    check -->|no| svd
+    check -->|yes| done[Return Z,E,S]
+```
+
+
+================================================================================
+SECTION 9 — RUNTIME FLOWCHARTS (Mermaid collection)
+================================================================================
+
+9.1 MODULE INTERACTION
+
+```mermaid
+flowchart LR
+    demo[demo.py]
+    dic[dic_constr.py]
+    hyper[HyperProTool.py]
+    lrsr[LRSR.py]
+    show[result_show.py]
+    roc[ROC_AUC.py]
+    demo --> dic
+    dic --> hyper
+    demo --> lrsr
+    demo --> show
+    demo --> roc
+    show --> hyper
+```
+
+
+9.2 TENSOR TRANSFORMATION FLOW
+
+```mermaid
+flowchart TD
+    cube["3D 100x100xB"]
+    mat["2D BxN"]
+    win["3D Bx9xN"]
+    dbg["D_bg BxKbg"]
+    dan["D_an Bx200"]
+    coefZ["Z KbgxN"]
+    coefS["S 200xN"]
+    tgt["target BxN"]
+    sc["scores N"]
+    cube -->|hyperconvert2d| mat
+    mat -->|hyperwincreat| win
+    win -->|SOMP+select| dbg
+    win -->|residuals| dan
+    mat -->|LRSR| coefZ
+    mat -->|LRSR| coefS
+    dbg --> tgt
+    dan --> tgt
+    tgt -->|L2 norm cols| sc
+```
+
+
+9.3 EXECUTION TIMELINE (sequential)
+
+```mermaid
+gantt
+    title demo.py runtime phases
+    dateFormat X
+    axisFormat %s
+    section Load
+    load_crop_bands :0, 2
+    section Dictionary
+    dic_constr :2, 300
+    section LRSR
+    LRSR_iter :300, 600
+    section Viz
+    result_show :600, 610
+    section Eval
+    ROC_AUC :610, 620
+```
+
+(Approximate seconds — varies by CPU.)
+
+
+9.4 DECOMPOSITION DIAGRAM
+
+```mermaid
+flowchart LR
+    D[data2d BxN]
+    Dbg[bg_dic BxKbg]
+    Dan[tg_dic Bx200]
+    Zmat[Z KbgxN]
+    Smat[S 200xN]
+    Emat[E BxN]
+    Dbg --> Zmat
+    Dan --> Smat
+    Zmat --> sum[sum]
+    Smat --> sum
+    Emat --> sum
+    sum --> D
+```
+
+
+9.5 DICTIONARY CONSTRUCTION SUBGRAPH
+
+```mermaid
+flowchart TD
+    clusters[10 clusters]
+    clusters --> c0[Cluster 0 SOMP all windows]
+    clusters --> c1[Cluster 1 ...]
+    clusters --> c9[Cluster 9 ...]
+    c0 --> atoms0[Top 5 percent atoms]
+    c1 --> atoms1[Top 5 percent atoms]
+    atoms0 --> stack[Stack columns bg_dic]
+    atoms1 --> stack
+    residuals[All residuals] --> top200[Top 200 pixels tg_dic]
+```
+
+
+================================================================================
+SECTION 10 — VIVA PREPARATION
+================================================================================
+
+10.1 BEGINNER QUESTIONS (15)
+----------------------------
+Q1.  What is a hyperspectral image?
+A:   Image where each pixel has many spectral bands, not just RGB.
+
+Q2.  What is an anomaly here?
+A:   Rare pixel with spectrum different from most of the scene.
+
+Q3.  What files do you need to run demo.py?
+A:   Sandiego.mat, PlaneGT.mat, and all .py modules.
+
+Q4.  What does demo.py do in order?
+A:   Load → dic_constr → LRSR → result_show → ROC_AUC.
+
+Q5.  What is N in this project?
+A:   Total pixels = rows × cols = 10000 for 100×100 crop.
+
+Q6.  What does each column of data2d represent?
+A:   One pixel's full spectrum across bands.
+
+Q7.  Why crop the image?
+A:   Reduce computation time for classroom experiments.
+
+Q8.  Why remove spectral bands?
+A:   Remove noisy/water absorption bands that confuse algorithms.
+
+Q9.  What is a dictionary in this code?
+A:   Matrix whose columns are reference spectra (atoms).
+
+Q10. What are D_bg and D_an?
+A:   Background dictionary and anomaly (target) dictionary.
+
+Q11. What is the anomaly score?
+A:   L2 norm of anomaly reconstruction vector per pixel.
+
+Q12. What is AUC?
+A:   Area under ROC curve — higher means better detection ranking.
+
+Q13. Is ground truth used for training?
+A:   No — only for evaluation in ROC_AUC (not in dic_constr body).
+
+Q14. What is displayed in result_show?
+A:   Background, anomaly, noise images + dict maps + clusters.
+
+Q15. How long does demo take roughly?
+A:   About 10–15 minutes on 100×100 crop.
+
+
+10.2 TECHNICAL QUESTIONS (15)
+-----------------------------
+Q16. What is JSR?
+A:   Joint Sparse Representation using windows and SOMP.
+
+Q17. What is LRSR equation?
+A:   data2d = bg_dic@Z + tg_dic@S + E.
+
+Q18. Why nuclear norm on Z?
+A:   Promotes low-rank background coefficient structure.
+
+Q19. Why L1 on S?
+A:   Forces sparse anomaly activations across pixels.
+
+Q20. What is SOMP?
+A:   Simultaneous OMP — greedy joint sparse coding on window matrix.
+
+Q21. What is sparsity score for bg atoms?
+A:   mean(|coeff|)/frequency — picks stable representative atoms.
+
+Q22. How are anomaly dict columns chosen?
+A:   Top 200 pixels with largest weighted SOMP residuals.
+
+Q23. What is ALM?
+A:   Augmented Lagrangian solver splitting constraints into iterations.
+
+Q24. What is SVT in LRSR?
+A:   Singular value thresholding for low-rank update on Z.
+
+Q25. Shape of S?
+A:   (200, 10000) — 200 anomaly atoms, coefficient per pixel.
+
+Q26. What does hyperconvert2d use order='F' for?
+A:   Column-major (Fortran) reshape consistent with MATLAB style data.
+
+Q27. Why PCA only for clustering?
+A:   Stable K-means; full bands still used for SOMP dictionaries.
+
+Q28. What is hyper_IPD?
+A:   Image patch distance between window and cluster centroid.
+
+Q29. beta and lmda in demo?
+A:   0.001 sparsity on S, 0.01 noise weight on E.
+
+Q30. What .mat must exist before result_show?
+A:   cluster_assment.mat from dic_constr.
+
+
+10.3 RESEARCH-ORIENTED QUESTIONS (10)
+-------------------------------------
+Q31. How does this differ from RX detector?
+A:   RX assumes Gaussian background; this uses dual dictionaries + LRSR.
+
+Q32. Paper contribution vs Xu 2015 low-rank sparse?
+A:   Joint construction of BOTH background and potential anomaly dictionaries.
+
+Q33. Why window size 3?
+A:   Small spatial context without blurring large anomalies too much.
+
+Q34. Limitations of sparsity assumption?
+A:   Large extended anomalies may violate sparse S model.
+
+Q35. Is method supervised at dictionary stage?
+A:   Unsupervised; groundtruth parameter in dic_constr is unused.
+
+Q36. Complexity bottleneck?
+A:   Nested cluster×window SOMP loops + LRSR SVD each iteration.
+
+Q37. Can parameters be changed without code edit?
+A:   Yes in demo_enhanced.py via config_default.yaml.
+
+Q38. What metric beyond AUC does enhanced give?
+A:   Precision, recall, F1, confusion matrix at optimal threshold.
+
+Q39. Why L2 normalize spectra?
+A:   Mitigate illumination — focus on spectral shape.
+
+Q40. Future improvement ideas?
+A:   GPU LRSR, adaptive window size, deep features — open research.
+
+
+================================================================================
+SECTION 11 — DEBUGGING GUIDE
+================================================================================
+
+11.1 WHERE ERRORS LIKELY HAPPEN
+-------------------------------
+
+| Error | Location | Cause |
+|-------|----------|-------|
+| FileNotFoundError Sandiego.mat | demo.py load | Missing dataset |
+| FileNotFoundError cluster_assment.mat | result_show | Skipped dic_constr |
+| Shape mismatch ROC | ROC_AUC | GT size ≠ crop size |
+| MemoryError | dic_constr / LRSR | Image too large |
+| Hang / slow | LRSR while loop | Normal — hundreds of iterations |
+| Empty plots | matplotlib | Headless server without display |
+
+
+11.2 COMMON TENSOR SHAPE MISTAKES
+---------------------------------
+MISTAKE: Thinking data2d is (N × B) — it is (B × N) in this code.
+MISTAKE: Forgetting N = rows * cols after crop.
+MISTAKE: Confusing win_matrix second dim w²=9 with N.
+MISTAKE: Multiplying matrices in wrong order — bg_dic@Z not Z@bg_dic.
+
+
+11.3 FILE DEPENDENCIES
+
+  demo.py
+    requires: Sandiego.mat, PlaneGT.mat
+    calls: dic_constr, LRSR, result_show, ROC_AUC
+
+  dic_constr.py
+    requires: HyperProTool.py, sklearn
+    writes: *.mat files
+
+  result_show.py
+    requires: cluster_assment.mat ON DISK
+
+  LRSR.py
+    requires: bg_dic, tg_dic, data2d shapes compatible:
+              bg_dic.shape[0] == tg_dic.shape[0] == data2d.shape[0]
+
+
+11.4 RUNTIME BOTTLENECKS
+------------------------
+1. dic_constr: for cluster in 0..9, for each window SOMP — O(clusters × N × K × B)
+2. LRSR: SVD every iteration — O(min(K_bg,N)²) roughly per iter
+3. Matplotlib imshow on 100×100 — minor
+
+SPEED TIPS (conceptual): smaller crop, fewer clusters, fewer target_dic_num,
+                        lower max LRSR iterations (code change required).
+
+
+11.5 DEBUG CHECKLIST
+--------------------
+[ ] Sandiego.mat and PlaneGT.mat in same folder as demo.py
+[ ] Crop size matches ground truth spatial size
+[ ] Ran dic_constr before result_show
+[ ] Python packages: numpy scipy sklearn matplotlib
+[ ] Enough RAM for 186×10000 matrices
+
+
+================================================================================
+SECTION 12 — MEMORY-BASED LEARNING
+================================================================================
+
+12.1 ONE-PAGE REVISION BOX
++--------------------------+
++------------------------------------------------------------------+
+|  HYPERSPECTRAL ANOMALY DETECTION — REVISION BOX                  |
++------------------------------------------------------------------+
+|  INPUT:  cube (H,W,B) → crop → (100,100,186)                     |
+|  MATRIX: data2d (186 × 10000)  columns = pixels                  |
+|  STEP 1: windows 3×3 → cluster 10 groups → SOMP K=10               |
+|  STEP 2: D_bg (186×Kbg) from top 5% atoms per cluster            |
+|          D_an (186×200) from top residual pixels                 |
+|  STEP 3: LRSR: data2d = D_bg·Z + D_an·S + E                      |
+|  STEP 4: score[i] = ||D_an·S[:,i]||_2                            |
+|  STEP 5: AUC vs PlaneGT                                          |
+|  KEY: JSR builds dicts, LRSR separates, norm scores detect         |
++------------------------------------------------------------------+
+
+
+12.2 QUICK RECALL (15 bullets)
+------------------------------
+1. B rows = bands, N cols = pixels in data2d.
+2. N = 10000 for default demo.
+3. demo.py calls dic_constr → LRSR → result_show → ROC_AUC.
+4. groundtruth NOT used inside dic_constr loops.
+5. win_size=3 → 9 spectra per window.
+6. cluster_num=10.
+7. SOMP K=10 atoms per window.
+8. tg_dic always 200 columns.
+9. Z is low-rank background coeffs.
+10. S is sparse anomaly coeffs.
+11. target2d = tg_dic @ S.
+12. Anomaly score = column L2 norm of target2d.
+13. cluster_assment.mat needed for plot 6.
+14. ALM iterates SVT + soft threshold + linear solves.
+15. Paper: background AND potential anomaly dictionary construction.
+
+
+12.3 MENTAL VISUALIZATION TRICKS
+-------------------------------
+TRICK "B-N": Every 2D matrix — Bands down, pixels across.
+TRICK "3-10-200": window 3, clusters 10, anomaly dict 200.
+TRICK "CAKE": reconstruction = base Z + chili S + crumb E.
+TRICK "COLUMN": one pixel = one column through entire pipeline.
+TRICK "TRAIN": demo.py → dic → LRSR → show → roc (5 stations).
+
+
+12.4 SIMPLIFIED ARCHITECTURE ASCII MAP
+
+                    ┌──────────────┐
+                    │  Sandiego    │
+                    │  .mat cube   │
+                    └──────┬───────┘
+                           │
+              ┌────────────▼────────────┐
+              │      PREPROCESS         │
+              │ crop | bands | L2 norm  │
+              └────────────┬────────────┘
+                           │ data2d (B×N)
+         ┌─────────────────┼─────────────────┐
+         │                 │                 │
+         ▼                 ▼                 ▼
+   ┌──────────┐     ┌──────────┐     ┌──────────┐
+   │ WINDOWS  │────►│  SOMP    │────►│  D_bg    │
+   │ K-means  │     │ residuals│     │  D_an    │
+   └──────────┘     └──────────┘     └────┬─────┘
+                                          │
+                                          ▼
+                                   ┌──────────┐
+                                   │   LRSR   │
+                                   │  Z S E   │
+                                   └────┬─────┘
+                                        │
+                          ┌─────────────┴─────────────┐
+                          ▼                           ▼
+                   ┌────────────┐              ┌────────────┐
+                   │  PLOTS     │              │ ROC / AUC  │
+                   │ result_show│              │  ROC_AUC   │
+                   └────────────┘              └────────────┘
+
+
+12.5 EXAM NIGHT FLOW (60-second recall)
+---------------------------------------
+"Load AVIRIS cube, crop, clean bands, make B×N matrix, normalize,
+cluster 3×3 patches, sparse-code each cluster, build bg and anomaly
+dictionaries, decompose image with low-rank Z and sparse S, score
+anomaly magnitude per pixel, measure AUC against airplane labels."
+
+
+================================================================================
+END OF info_given.txt
+================================================================================
+
+For file-by-file listing see: File_info.md
+For paper equations see: RESEARCH_PAPER_OVERVIEW.md
+To run: python demo.py  (with .mat files present)

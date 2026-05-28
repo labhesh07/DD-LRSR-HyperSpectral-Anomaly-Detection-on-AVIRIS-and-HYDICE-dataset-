@@ -1,0 +1,97 @@
+{
+    "timestamp": "20251121_010118",
+    "experiment_date": "2025-11-21T01:12:56.068336",
+    "metrics": {
+        "AUC": 0.9905028839825603,
+        "Precision": 0.12993039443155452,
+        "Recall": 0.9824561403508771,
+        "F1_Score": 0.22950819672131148,
+        "Accuracy": 0.9624,
+        "Optimal_Threshold": 0.36802806321900056,
+        "True_Positives": 56,
+        "False_Positives": 375,
+        "True_Negatives": 9568,
+        "False_Negatives": 1,
+        "Confusion_Matrix": [
+            [
+                9568,
+                375
+            ],
+            [
+                1,
+                56
+            ]
+        ]
+    },
+    "performance": {
+        "total_time": null,
+        "stage_timings": {
+            "Data Loading & Preprocessing": 0.7187032699584961,
+            "Dictionary Construction": 212.58968043327332,
+            "Low Rank & Sparse Representation": 430.56246161460876,
+            "Result Visualization": 24.56484603881836,
+            "Enhanced Metrics Calculation": 0.24637556076049805,
+            "ROC Curve Calculation": 27.670398235321045,
+            "Enhanced Visualizations": 1.6967456340789795
+        }
+    },
+    "configuration": {
+        "data": {
+            "input_file": "Sandiego.mat",
+            "groundtruth_file": "PlaneGT.mat",
+            "crop_rows": 100,
+            "crop_cols": 100,
+            "remove_bands": {
+                "ranges": [
+                    [
+                        0,
+                        6
+                    ],
+                    [
+                        32,
+                        35
+                    ],
+                    [
+                        93,
+                        97
+                    ],
+                    [
+                        106,
+                        113
+                    ],
+                    [
+                        152,
+                        166
+                    ],
+                    [
+                        220,
+                        224
+                    ]
+                ]
+            }
+        },
+        "dictionary_construction": {
+            "win_size": 3,
+            "cluster_num": 10,
+            "K": 10,
+            "selected_dic_percent": 0.05,
+            "target_dic_num": 200
+        },
+        "lrsr": {
+            "beta": 0.001,
+            "lmda": 0.01,
+            "max_iterations": 500,
+            "convergence_error": 1e-06
+        },
+        "output": {
+            "save_results": true,
+            "save_plots": true,
+            "output_dir": "results",
+            "export_formats": [
+                "mat",
+                "json",
+                "csv"
+            ]
+        }
+    }
+}
