@@ -1,4 +1,4 @@
-# Hyperspectral Anomaly Detection (JSR + LRSR)
+# Hyperspectral Anomaly Detection (DD + JSR + LRSR)
 
 This repository detects anomalies (for example, airplanes in AVIRIS scenes) from hyperspectral data without supervised training labels. It combines:
 - **Joint Sparse Representation (JSR)** for dictionary construction
