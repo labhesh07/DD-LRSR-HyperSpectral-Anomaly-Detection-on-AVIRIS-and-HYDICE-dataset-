@@ -1,9 +1,5 @@
 # Hyperspectral Anomaly Detection (JSR + LRSR)
 
-Python implementation of the method from:
-**"Hyperspectral Anomaly Detection via Background and Potential Anomaly Detection"**  
-IEEE: [https://ieeexplore.ieee.org/abstract/document/8519775](https://ieeexplore.ieee.org/abstract/document/8519775)
-
 This repository detects anomalies (for example, airplanes in AVIRIS scenes) from hyperspectral data without supervised training labels. It combines:
 - **Joint Sparse Representation (JSR)** for dictionary construction
 - **Low-Rank and Sparse Representation (LRSR)** for global decomposition
@@ -199,3 +195,6 @@ If this repository helps your research, please cite:
 
 - AVIRIS data source and prior low-rank sparse anomaly detection work
 - Original and enhanced code contributors for this implementation
+- Python implementation of the method from:
+**"Hyperspectral Anomaly Detection via Background and Potential Anomaly Detection"**  
+ IEEE: [https://ieeexplore.ieee.org/abstract/document/8519775](https://ieeexplore.ieee.org/abstract/document/8519775)
